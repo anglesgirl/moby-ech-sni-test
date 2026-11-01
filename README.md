@@ -58,3 +58,31 @@ The package does not replace or modify the system Docker daemon. Review the incl
 ## Source and license
 
 `moby-ech-sni-fragmentation.patch` contains the local source diff against Moby. The binary is built from that modified source tree for testing. Moby is distributed under Apache-2.0; corresponding `LICENSE` and `NOTICE` are included in the repository and archive.
+
+---
+
+## One-command deployment (国内一键部署)
+
+For users in mainland China who want to pull from Docker Hub without a proxy, install the ECH + SNI-fragmentation daemon on a fresh VPS with a single command:
+
+```bash
+curl -fsSL https://github.com/anglesgirl/moby-ech-sni-test/releases/download/v0.2.0/install-docker-ech-sni.sh | sudo bash
+```
+
+What the script does automatically:
+
+1. Installs `docker-ce-cli` + `runc` (minimal, no official engine) via the Docker apt repository.
+2. Downloads `docker-ech-sni-fragment-linux-amd64.tar.gz` (ECH + fragmentation build) and verifies its SHA-256.
+3. Installs the patched `dockerd` as `/usr/bin/dockerd` (original backed up to `/usr/bin/dockerd.bak-ech`).
+4. Creates a `docker-ech` systemd service with `MOBY_TLS_FRAGMENT_CLIENT_HELLO=1` (falls back to background start if systemd is absent; auto-degrades to `--bridge=none --iptables=false` on unprivileged hosts).
+5. Verifies with `docker pull hello-world` — expect `Download complete` without a proxy.
+
+Restore the original daemon:
+
+```bash
+sudo systemctl stop docker-ech
+sudo mv /usr/bin/dockerd.bak-ech /usr/bin/dockerd
+sudo systemctl start docker-ech
+```
+
+Release assets (v0.2.0): `docker-ech-sni-fragment-linux-amd64.tar.gz` · `SHA256SUMS` · `install-docker-ech-sni.sh`
