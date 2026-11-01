@@ -1,0 +1,1533 @@
+diff --git a/daemon/hosts.go b/daemon/hosts.go
+index f01c71b..3c4d41b 100644
+--- a/daemon/hosts.go
++++ b/daemon/hosts.go
+@@ -15,6 +15,8 @@
+ 	"github.com/containerd/containerd/v2/core/remotes/docker"
+ 	hostconfig "github.com/containerd/containerd/v2/core/remotes/docker/config"
+ 	cerrdefs "github.com/containerd/errdefs"
++	"github.com/moby/moby/v2/daemon/internal/echtls"
++	"github.com/moby/moby/v2/daemon/internal/tlsfragment"
+ 	"github.com/moby/moby/v2/daemon/pkg/registry"
+ 	"github.com/pkg/errors"
+ )
+@@ -36,6 +38,17 @@ func (daemon *Daemon) RegistryHosts(host string) ([]docker.RegistryHost, error)
+ 			hosts, err = daemon.mergeLegacyConfig(host, hosts)
+ 		}
+ 	}
++	if err == nil {
++		for i := range hosts {
++			if hosts[i].Client == nil {
++				continue
++			}
++			if tr, ok := hosts[i].Client.Transport.(*http.Transport); ok {
++				tr = tlsfragment.WrapTransport(tr)
++				hosts[i].Client.Transport = echtls.WrapTransport(tr, echtls.DefaultConfigSource())
++			}
++		}
++	}
+ 
+ 	return hosts, err
+ }
+diff --git a/daemon/internal/distribution/registry.go b/daemon/internal/distribution/registry.go
+index 4aefd9a..daebd44 100644
+--- a/daemon/internal/distribution/registry.go
++++ b/daemon/internal/distribution/registry.go
+@@ -12,6 +12,8 @@
+ 	"github.com/docker/distribution/registry/client"
+ 	"github.com/docker/distribution/registry/client/auth"
+ 	registrytypes "github.com/moby/moby/api/types/registry"
++	"github.com/moby/moby/v2/daemon/internal/echtls"
++	"github.com/moby/moby/v2/daemon/internal/tlsfragment"
+ 	v2 "github.com/moby/moby/v2/daemon/pkg/plugin/v2"
+ 	"github.com/moby/moby/v2/daemon/pkg/registry"
+ 	"github.com/moby/moby/v2/dockerversion"
+@@ -90,9 +92,10 @@ func newRepository(
+ 		TLSClientConfig:     endpoint.TLSConfig,
+ 		IdleConnTimeout:     30 * time.Second,
+ 	}
++	baseTransport := echtls.WrapTransport(tlsfragment.WrapTransport(base), echtls.DefaultConfigSource())
+ 
+ 	modifiers := registry.Headers(dockerversion.DockerUserAgent(ctx), metaHeaders)
+-	authTransport := newTransport(base, modifiers...)
++	authTransport := newTransport(baseTransport, modifiers...)
+ 
+ 	challengeManager, err := registry.PingV2Registry(endpoint.URL, authTransport)
+ 	if err != nil {
+@@ -124,7 +127,7 @@ func newRepository(
+ 		modifiers = append(modifiers, auth.NewAuthorizer(challengeManager, tokenHandler, basicHandler))
+ 	}
+ 
+-	tr := newTransport(base, modifiers...)
++	tr := newTransport(baseTransport, modifiers...)
+ 
+ 	// FIXME(thaJeztah): should this just take the original repoInfo.Name instead of converting the remote name back to a named reference?
+ 	repoNameRef, err := reference.WithName(repoName)
+diff --git a/daemon/internal/echtls/live_test.go b/daemon/internal/echtls/live_test.go
+new file mode 100644
+index 0000000..3a6a344
+--- /dev/null
++++ b/daemon/internal/echtls/live_test.go
+@@ -0,0 +1,321 @@
++package echtls
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// This live test is opt-in because it depends on public DNS and registry
++// availability. It tests, rather than assumes, whether Cloudflare's shared ECH
++// config can be used for Docker Hub's separate registry/auth/blob hostnames.
++func TestLiveCloudflareSharedECH(t *testing.T) {
++	if os.Getenv("MOBY_ECH_LIVE_TEST") != "1" {
++		t.Skip("set MOBY_ECH_LIVE_TEST=1 to test public Cloudflare and Docker endpoints")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
++	defer cancel()
++
++	list, err := cloudflarePublicECHConfig(ctx)
++	if err != nil {
++		t.Fatalf("fetch cloudflare-ech.com ECHConfigList: %v", err)
++	}
++	base := http.DefaultTransport.(*http.Transport).Clone()
++	plainClient := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(), Timeout: 20 * time.Second}
++	client := &http.Client{
++		Transport: WrapTransport(base, staticSource(list)),
++		Timeout:   20 * time.Second,
++		CheckRedirect: func(req *http.Request, via []*http.Request) error {
++			if len(via) > 0 && req.URL.Hostname() != via[len(via)-1].URL.Hostname() {
++				t.Logf("redirect-host %s -> %s", via[len(via)-1].URL.Hostname(), req.URL.Hostname())
++			}
++			if len(via) >= 10 {
++				return fmt.Errorf("stopped after 10 redirects")
++			}
++			return nil
++		},
++	}
++
++	// Browser-observed positive control: the owner supplied a Cloudflare trace
++	// screenshot for hub.docker.com showing sni=encrypted and TLS 1.3.
++	traceResp, err := client.Get("https://hub.docker.com/cdn-cgi/trace")
++	if err != nil {
++		t.Logf("hub.docker.com error: %s", liveError(err))
++	} else {
++		trace, _ := io.ReadAll(io.LimitReader(traceResp.Body, 16<<10))
++		_ = traceResp.Body.Close()
++		t.Logf("hub.docker.com status=%s ech_accepted=%t tls=%s trace_encrypted=%t", traceResp.Status, traceResp.TLS != nil && traceResp.TLS.ECHAccepted, tlsVersion(traceResp), strings.Contains(string(trace), "sni=encrypted"))
++	}
++
++	// Registry API should answer 401 without credentials; the TLS state tells us
++	// whether this specific service accepted the shared ECH config.
++	registryResp, err := client.Get("https://registry-1.docker.io/v2/")
++	if err != nil {
++		t.Logf("registry-1.docker.io error: %s", liveError(err))
++	} else {
++		registryECH := registryResp.TLS != nil && registryResp.TLS.ECHAccepted
++		t.Logf("registry-1.docker.io status=%s ech_accepted=%t tls=%s", registryResp.Status, registryECH, tlsVersion(registryResp))
++		_ = registryResp.Body.Close()
++	}
++
++	// Acquire only a public pull token for the public hello-world image; never
++	// print or persist the token.
++	tokenURL := "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/hello-world:pull"
++	tokenResp, err := client.Get(tokenURL)
++	if err != nil {
++		t.Logf("auth.docker.io error: %s", liveError(err))
++		return
++	}
++	tokenECH := tokenResp.TLS != nil && tokenResp.TLS.ECHAccepted
++	t.Logf("auth.docker.io status=%s ech_accepted=%t tls=%s", tokenResp.Status, tokenECH, tlsVersion(tokenResp))
++	var tokenData struct {
++		Token       string `json:"token"`
++		AccessToken string `json:"access_token"`
++	}
++	if tokenResp.StatusCode == http.StatusOK {
++		if err := json.NewDecoder(io.LimitReader(tokenResp.Body, 1<<20)).Decode(&tokenData); err != nil {
++			_ = tokenResp.Body.Close()
++			t.Logf("decode auth token response: %T", err)
++			return
++		}
++	}
++	_ = tokenResp.Body.Close()
++	token := tokenData.Token
++	if token == "" {
++		token = tokenData.AccessToken
++	}
++	if token == "" {
++		t.Log("no public pull token returned; skipping manifest/blob host checks")
++		return
++	}
++
++	manifestURL := "https://registry-1.docker.io/v2/library/hello-world/manifests/latest"
++	manifestReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
++	manifestReq.Header.Set("Authorization", "Bearer "+token)
++	manifestReq.Header.Set("Accept", strings.Join([]string{
++		"application/vnd.oci.image.index.v1+json",
++		"application/vnd.docker.distribution.manifest.list.v2+json",
++		"application/vnd.oci.image.manifest.v1+json",
++		"application/vnd.docker.distribution.manifest.v2+json",
++	}, ", "))
++	manifestResp, err := plainClient.Do(manifestReq)
++	if err != nil {
++		t.Logf("manifest request error: %T", err)
++		return
++	}
++	manifestECH := manifestResp.TLS != nil && manifestResp.TLS.ECHAccepted
++	t.Logf("manifest host=%s status=%s ech_accepted=%t tls=%s", manifestResp.Request.URL.Hostname(), manifestResp.Status, manifestECH, tlsVersion(manifestResp))
++	if manifestResp.StatusCode != http.StatusOK {
++		_ = manifestResp.Body.Close()
++		return
++	}
++	var image struct {
++		Manifests []struct {
++			Digest   string `json:"digest"`
++			Platform struct {
++				OS           string `json:"os"`
++				Architecture string `json:"architecture"`
++			} `json:"platform"`
++		} `json:"manifests"`
++		Layers []struct {
++			Digest string `json:"digest"`
++		} `json:"layers"`
++	}
++	manifestBytes, err := io.ReadAll(io.LimitReader(manifestResp.Body, 2<<20))
++	_ = manifestResp.Body.Close()
++	if err != nil {
++		t.Logf("read manifest: %T", err)
++		return
++	}
++	if err := json.Unmarshal(manifestBytes, &image); err != nil {
++		t.Logf("decode manifest: %T", err)
++		return
++	}
++	if len(image.Manifests) > 0 {
++		digest := image.Manifests[0].Digest
++		for _, candidate := range image.Manifests {
++			if candidate.Platform.OS == "linux" && candidate.Platform.Architecture == "amd64" {
++				digest = candidate.Digest
++				break
++			}
++		}
++		childURL := "https://registry-1.docker.io/v2/library/hello-world/manifests/" + digest
++		childReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, childURL, nil)
++		childReq.Header.Set("Authorization", "Bearer "+token)
++		childReq.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json")
++		childResp, err := plainClient.Do(childReq)
++		if err != nil {
++			t.Logf("platform manifest request error: %T", err)
++			return
++		}
++		t.Logf("platform manifest host=%s status=%s ech_accepted=%t tls=%s", childResp.Request.URL.Hostname(), childResp.Status, childResp.TLS != nil && childResp.TLS.ECHAccepted, tlsVersion(childResp))
++		if childResp.StatusCode != http.StatusOK {
++			_ = childResp.Body.Close()
++			return
++		}
++		manifestBytes, err = io.ReadAll(io.LimitReader(childResp.Body, 2<<20))
++		_ = childResp.Body.Close()
++		if err != nil || json.Unmarshal(manifestBytes, &image) != nil {
++			t.Logf("could not decode platform manifest")
++			return
++		}
++	}
++	if len(image.Layers) == 0 {
++		t.Log("image manifest contains no layers")
++		return
++	}
++	blobURL := "https://registry-1.docker.io/v2/library/hello-world/blobs/" + image.Layers[0].Digest
++	plainBlobClient := &http.Client{
++		Transport: http.DefaultTransport.(*http.Transport).Clone(),
++		Timeout:   20 * time.Second,
++		CheckRedirect: func(*http.Request, []*http.Request) error {
++			return http.ErrUseLastResponse
++		},
++	}
++	plainBlobReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
++	plainBlobReq.Header.Set("Authorization", "Bearer "+token)
++	plainBlobResp, err := plainBlobClient.Do(plainBlobReq)
++	if err != nil {
++		t.Logf("plain blob redirect request error: %s", liveError(err))
++		return
++	}
++	location, err := url.Parse(plainBlobResp.Header.Get("Location"))
++	plainStatus := plainBlobResp.Status
++	_ = plainBlobResp.Body.Close()
++	if err != nil || location.Hostname() == "" {
++		t.Logf("blob request did not yield an external redirect: status=%s", plainStatus)
++		return
++	}
++	t.Logf("actual blob redirect host=%s status=%s", location.Hostname(), plainStatus)
++	plainFollowClient := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(), Timeout: 20 * time.Second}
++	plainFollowReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
++	plainFollowReq.Header.Set("Authorization", "Bearer "+token)
++	plainFollowResp, err := plainFollowClient.Do(plainFollowReq)
++	if err != nil {
++		t.Logf("normal TLS blob request error: %s", liveError(err))
++	} else {
++		t.Logf("normal TLS blob final-host=%s status=%s tls=%s", plainFollowResp.Request.URL.Hostname(), plainFollowResp.Status, tlsVersion(plainFollowResp))
++		_ = plainFollowResp.Body.Close()
++	}
++
++	// Repeat the real blob request normally through the registry, but apply the
++	// shared ECHConfigList only to the observed blob redirect destination(s).
++	blobSource := &selectedHostsSource{list: list, hosts: make(map[string]struct{})}
++	blobSource.add(location.Hostname())
++	blobClient := &http.Client{
++		Transport: WrapTransport(http.DefaultTransport.(*http.Transport).Clone(), blobSource),
++		Timeout:   20 * time.Second,
++		CheckRedirect: func(req *http.Request, via []*http.Request) error {
++			if len(via) > 0 {
++				previous := via[len(via)-1].Response
++				if previous != nil {
++					t.Logf("blob hop host=%s ech_accepted=%t", previous.Request.URL.Hostname(), previous.TLS != nil && previous.TLS.ECHAccepted)
++				}
++			}
++			blobSource.add(req.URL.Hostname())
++			if len(via) >= 10 {
++				return fmt.Errorf("stopped after 10 redirects")
++			}
++			return nil
++		},
++	}
++	blobReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
++	blobReq.Header.Set("Authorization", "Bearer "+token)
++	blobResp, err := blobClient.Do(blobReq)
++	if err != nil {
++		t.Logf("ECH blob request error: %s", liveError(err))
++		return
++	}
++	t.Logf("blob final-host=%s status=%s ech_accepted=%t tls=%s", blobResp.Request.URL.Hostname(), blobResp.Status, blobResp.TLS != nil && blobResp.TLS.ECHAccepted, tlsVersion(blobResp))
++	_ = blobResp.Body.Close()
++}
++
++type selectedHostsSource struct {
++	list  []byte
++	mu    sync.RWMutex
++	hosts map[string]struct{}
++}
++
++func (s *selectedHostsSource) add(host string) {
++	s.mu.Lock()
++	s.hosts[canonicalHost(host)] = struct{}{}
++	s.mu.Unlock()
++}
++
++func (s *selectedHostsSource) ConfigList(_ context.Context, host string) ([]byte, time.Duration, error) {
++	s.mu.RLock()
++	_, ok := s.hosts[canonicalHost(host)]
++	s.mu.RUnlock()
++	if !ok {
++		return nil, time.Minute, nil
++	}
++	return append([]byte(nil), s.list...), time.Minute, nil
++}
++
++func liveError(err error) string {
++	var urlErr *url.Error
++	if errors.As(err, &urlErr) {
++		err = urlErr.Err
++	}
++	var rejected *tls.ECHRejectionError
++	if errors.As(err, &rejected) {
++		return fmt.Sprintf("ECH rejection (retry config bytes=%d)", len(rejected.RetryConfigList))
++	}
++	return fmt.Sprintf("%T: %s", err, err)
++}
++
++func cloudflarePublicECHConfig(ctx context.Context) ([]byte, error) {
++	endpoint := "https://cloudflare-dns.com/dns-query?name=cloudflare-ech.com&type=65"
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Accept", "application/dns-json")
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("DoH returned %s", resp.Status)
++	}
++	var answer struct {
++		Status int `json:"Status"`
++		Answer []struct {
++			Data string `json:"data"`
++		} `json:"Answer"`
++	}
++	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&answer); err != nil {
++		return nil, err
++	}
++	for _, rr := range answer.Answer {
++		for _, field := range strings.Fields(rr.Data) {
++			if value, ok := strings.CutPrefix(field, "ech="); ok {
++				return base64.StdEncoding.DecodeString(value)
++			}
++		}
++	}
++	return nil, fmt.Errorf("no ech= parameter in cloudflare-ech.com HTTPS answer (rcode %d)", answer.Status)
++}
++
++func tlsVersion(resp *http.Response) string {
++	if resp.TLS == nil {
++		return "none"
++	}
++	return tls.VersionName(resp.TLS.Version)
++}
++
++// Ensure net/url stays part of the live test's public URL handling in Go's
++// standard library when redirect behavior changes.
++var _ = (*url.URL).Hostname
+diff --git a/daemon/internal/echtls/transport.go b/daemon/internal/echtls/transport.go
+new file mode 100644
+index 0000000..eb7cfba
+--- /dev/null
++++ b/daemon/internal/echtls/transport.go
+@@ -0,0 +1,387 @@
++// Package echtls adds opportunistic ECH support to Moby's registry HTTP clients.
++package echtls
++
++import (
++	"context"
++	"crypto/sha256"
++	"crypto/tls"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/miekg/dns"
++)
++
++// ConfigSource looks up the ECHConfigList advertised for host. A nil or empty
++// list means that the host has not advertised ECH. ttl is used by sources to
++// bound how long discovered data may be cached.
++type ConfigSource interface {
++	ConfigList(ctx context.Context, host string) (list []byte, ttl time.Duration, err error)
++}
++
++// DNSConfigSource discovers ECHConfigLists from HTTPS/SVCB DNS records and
++// caches each result for no longer than its DNS TTL.
++type DNSConfigSource struct {
++	resolvConf string
++	mu         sync.Mutex
++	cache      map[string]dnsCacheEntry
++}
++
++type dnsCacheEntry struct {
++	list      []byte
++	expiresAt time.Time
++}
++
++// NewDNSConfigSource creates a source using the system's resolv.conf file.
++// This is a small cross-platform-aware prototype; platforms without a
++// resolv.conf (notably Windows) will simply report discovery errors, which the
++// transport treats as absence of an optional ECH advertisement.
++func NewDNSConfigSource() *DNSConfigSource {
++	return &DNSConfigSource{resolvConf: "/etc/resolv.conf", cache: make(map[string]dnsCacheEntry)}
++}
++
++var (
++	defaultSourceOnce sync.Once
++	defaultSource     *DNSConfigSource
++)
++
++// DefaultConfigSource returns a process-wide source so registry host clients
++// share DNS results and refresh them at the advertised TTL.
++func DefaultConfigSource() ConfigSource {
++	defaultSourceOnce.Do(func() { defaultSource = NewDNSConfigSource() })
++	return defaultSource
++}
++
++func (s *DNSConfigSource) ConfigList(ctx context.Context, host string) ([]byte, time.Duration, error) {
++	host = canonicalHost(host)
++	if host == "" || net.ParseIP(host) != nil {
++		return nil, time.Minute, nil
++	}
++
++	now := time.Now()
++	s.mu.Lock()
++	entry, ok := s.cache[host]
++	if ok && now.Before(entry.expiresAt) {
++		list := append([]byte(nil), entry.list...)
++		ttl := time.Until(entry.expiresAt)
++		s.mu.Unlock()
++		return list, ttl, nil
++	}
++	s.mu.Unlock()
++
++	list, ttl, err := s.lookup(ctx, host)
++	if err != nil {
++		return nil, 0, err
++	}
++	if ttl <= 0 {
++		ttl = time.Second
++	}
++	s.mu.Lock()
++	s.cache[host] = dnsCacheEntry{list: append([]byte(nil), list...), expiresAt: time.Now().Add(ttl)}
++	s.mu.Unlock()
++	return append([]byte(nil), list...), ttl, nil
++}
++
++func canonicalHost(host string) string {
++	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
++	return strings.ToLower(strings.Trim(host, "[]"))
++}
++
++func (s *DNSConfigSource) lookup(ctx context.Context, host string) ([]byte, time.Duration, error) {
++	name := dns.Fqdn(host)
++	var ttl time.Duration
++	for hop := 0; hop < 8; hop++ {
++		msg := new(dns.Msg)
++		msg.SetQuestion(name, dns.TypeHTTPS)
++		response, err := s.exchange(ctx, msg)
++		if err != nil {
++			return nil, 0, err
++		}
++		if response.Rcode == dns.RcodeNameError {
++			return nil, minTTL(ttl, negativeTTL(response)), nil
++		}
++		if response.Rcode != dns.RcodeSuccess {
++			return nil, 0, fmt.Errorf("HTTPS DNS query for %s: %s", name, dns.RcodeToString[response.Rcode])
++		}
++
++		var alias string
++		for _, answer := range response.Answer {
++			rr, ok := answer.(*dns.HTTPS)
++			if !ok {
++				continue
++			}
++			rrTTL := time.Duration(rr.Hdr.Ttl) * time.Second
++			if rr.Priority == 0 {
++				alias = strings.TrimSuffix(rr.Target, ".")
++				ttl = minTTL(ttl, rrTTL)
++				break
++			}
++			for _, value := range rr.Value {
++				if ech, ok := value.(*dns.SVCBECHConfig); ok && len(ech.ECH) != 0 {
++					return append([]byte(nil), ech.ECH...), minTTL(ttl, rrTTL), nil
++				}
++			}
++			ttl = minTTL(ttl, rrTTL)
++		}
++		if alias != "" && alias != "." {
++			name = dns.Fqdn(alias)
++			continue
++		}
++		return nil, minTTL(ttl, negativeTTL(response)), nil
++	}
++	return nil, 0, fmt.Errorf("too many HTTPS DNS alias records for %s", host)
++}
++
++func (s *DNSConfigSource) exchange(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
++	config, err := dns.ClientConfigFromFile(s.resolvConf)
++	if err != nil {
++		return nil, fmt.Errorf("load DNS resolver configuration: %w", err)
++	}
++	if len(config.Servers) == 0 {
++		return nil, errors.New("DNS resolver configuration has no name servers")
++	}
++	timeout := time.Duration(config.Timeout) * time.Second
++	if timeout <= 0 {
++		timeout = 2 * time.Second
++	}
++	var lastErr error
++	for _, server := range config.Servers {
++		address := net.JoinHostPort(server, config.Port)
++		client := &dns.Client{Net: "udp", Timeout: timeout}
++		response, _, err := client.ExchangeContext(ctx, msg, address)
++		if err == nil && response.Truncated {
++			client.Net = "tcp"
++			response, _, err = client.ExchangeContext(ctx, msg, address)
++		}
++		if err == nil {
++			return response, nil
++		}
++		lastErr = err
++	}
++	return nil, fmt.Errorf("query HTTPS DNS records: %w", lastErr)
++}
++
++func negativeTTL(msg *dns.Msg) time.Duration {
++	for _, rr := range msg.Ns {
++		if soa, ok := rr.(*dns.SOA); ok {
++			ttl := soa.Hdr.Ttl
++			if soa.Minttl < ttl {
++				ttl = soa.Minttl
++			}
++			if ttl > 0 {
++				return time.Duration(ttl) * time.Second
++			}
++		}
++	}
++	return time.Minute
++}
++
++func minTTL(a, b time.Duration) time.Duration {
++	if a <= 0 || b < a {
++		return b
++	}
++	return a
++}
++
++// Transport wraps an *http.Transport and adds ECH when its ConfigSource has an
++// HTTPS/SVCB ECHConfigList for the request's actual TLS hostname. Requests
++// without an advertisement use the original transport unchanged.
++type Transport struct {
++	base   *http.Transport
++	source ConfigSource
++
++	mu         sync.Mutex
++	transports map[string]cachedTransport
++}
++
++type cachedTransport struct {
++	fingerprint [32]byte
++	transport   *http.Transport
++}
++
++// WrapTransport wraps base. If base is not an *http.Transport, it is returned
++// unchanged because cloning an opaque RoundTripper could lose TLS policy.
++func WrapTransport(base *http.Transport, source ConfigSource) *Transport {
++	if source == nil {
++		source = DefaultConfigSource()
++	}
++	return &Transport{base: base, source: source, transports: make(map[string]cachedTransport)}
++}
++
++func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
++	if req.URL == nil || req.URL.Scheme != "https" {
++		return t.base.RoundTrip(req)
++	}
++	host := canonicalHost(req.URL.Hostname())
++	if host == "" || net.ParseIP(host) != nil || t.base.DialTLS != nil || t.base.DialTLSContext != nil {
++		return t.base.RoundTrip(req)
++	}
++	list, _, err := t.source.ConfigList(req.Context(), host)
++	if err != nil || len(list) == 0 {
++		// ECH is opportunistic: DNS failures or no advertisement preserve the
++		// existing, normally verified TLS path. Once ECH is attempted, however,
++		// a rejection is never silently downgraded to plaintext SNI.
++		return t.base.RoundTrip(req)
++	}
++
++	tr, err := t.transportFor(host, list)
++	if err != nil {
++		return nil, err
++	}
++	capture := &dialCapture{}
++	ctx := context.WithValue(req.Context(), dialCaptureKey{}, capture)
++	attempt := req.Clone(ctx)
++	resp, err := tr.RoundTrip(attempt)
++	if err == nil {
++		return resp, nil
++	}
++
++	var rejection *tls.ECHRejectionError
++	if !errors.As(err, &rejection) || len(rejection.RetryConfigList) == 0 || !replayable(req) {
++		return nil, err
++	}
++	if isProxied(t.base, req) {
++		// A proxy controls origin DNS and may route the retry to a different
++		// server. RFC 9849 forbids using addresses learned after rejection.
++		return nil, err
++	}
++	pinnedAddr := capture.address()
++	if !isPinnedIPAddr(pinnedAddr) {
++		return nil, err
++	}
++	retryReq, err := cloneForRetry(req)
++	if err != nil {
++		return nil, err
++	}
++	retryTransport, err := t.newTransport(rejection.RetryConfigList, pinnedAddr)
++	if err != nil {
++		return nil, err
++	}
++	defer retryTransport.CloseIdleConnections()
++	return retryTransport.RoundTrip(retryReq)
++}
++
++// CloseIdleConnections preserves http.Client's connection cleanup behavior for
++// both the baseline transport and the per-host ECH transports.
++func (t *Transport) CloseIdleConnections() {
++	t.base.CloseIdleConnections()
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	for _, cached := range t.transports {
++		cached.transport.CloseIdleConnections()
++	}
++}
++
++func (t *Transport) transportFor(host string, list []byte) (*http.Transport, error) {
++	fingerprint := sha256.Sum256(list)
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if cached, ok := t.transports[host]; ok && cached.fingerprint == fingerprint {
++		return cached.transport, nil
++	}
++	tr, err := t.newTransport(list, "")
++	if err != nil {
++		return nil, err
++	}
++	if old, ok := t.transports[host]; ok {
++		old.transport.CloseIdleConnections()
++	}
++	t.transports[host] = cachedTransport{fingerprint: fingerprint, transport: tr}
++	return tr, nil
++}
++
++func (t *Transport) newTransport(list []byte, pinnedAddr string) (*http.Transport, error) {
++	tr := t.base.Clone()
++	if tr.TLSClientConfig != nil {
++		tr.TLSClientConfig = tr.TLSClientConfig.Clone()
++	} else {
++		tr.TLSClientConfig = &tls.Config{}
++	}
++	config := tr.TLSClientConfig
++	if config.MaxVersion != 0 && config.MaxVersion < tls.VersionTLS13 {
++		return nil, errors.New("ECH requires TLS 1.3 but the registry TLS configuration sets a lower maximum")
++	}
++	if config.MinVersion > tls.VersionTLS13 {
++		return nil, errors.New("ECH requires TLS 1.3 but the registry TLS configuration sets a higher minimum")
++	}
++	if config.MinVersion < tls.VersionTLS13 {
++		config.MinVersion = tls.VersionTLS13
++	}
++	config.EncryptedClientHelloConfigList = append([]byte(nil), list...)
++
++	dial := tr.DialContext
++	if dial == nil {
++		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
++		dial = d.DialContext
++	}
++	if pinnedAddr != "" {
++		tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
++			return dial(ctx, network, pinnedAddr)
++		}
++	} else {
++		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++			conn, err := dial(ctx, network, addr)
++			if err == nil {
++				if capture, ok := ctx.Value(dialCaptureKey{}).(*dialCapture); ok {
++					capture.set(conn.RemoteAddr().String())
++				}
++			}
++			return conn, err
++		}
++	}
++	return tr, nil
++}
++
++func isProxied(tr *http.Transport, req *http.Request) bool {
++	if tr.Proxy == nil {
++		return false
++	}
++	proxy, err := tr.Proxy(req)
++	return err != nil || proxy != nil
++}
++
++func replayable(req *http.Request) bool {
++	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
++}
++
++func cloneForRetry(req *http.Request) (*http.Request, error) {
++	retry := req.Clone(req.Context())
++	if req.Body != nil && req.Body != http.NoBody {
++		body, err := req.GetBody()
++		if err != nil {
++			return nil, err
++		}
++		retry.Body = body
++	}
++	return retry, nil
++}
++
++func isPinnedIPAddr(addr string) bool {
++	host, port, err := net.SplitHostPort(addr)
++	return err == nil && port != "" && net.ParseIP(host) != nil
++}
++
++type dialCaptureKey struct{}
++type dialCapture struct {
++	mu   sync.Mutex
++	addr string
++}
++
++func (c *dialCapture) set(addr string) {
++	c.mu.Lock()
++	c.addr = addr
++	c.mu.Unlock()
++}
++
++func (c *dialCapture) address() string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.addr
++}
++
++// Compile-time check: Transport intentionally implements net/http's contract.
++var _ http.RoundTripper = (*Transport)(nil)
+diff --git a/daemon/internal/echtls/transport_test.go b/daemon/internal/echtls/transport_test.go
+new file mode 100644
+index 0000000..2cb6491
+--- /dev/null
++++ b/daemon/internal/echtls/transport_test.go
+@@ -0,0 +1,204 @@
++package echtls
++
++import (
++	"context"
++	"crypto/ecdh"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"errors"
++	"math/big"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"golang.org/x/crypto/cryptobyte"
++)
++
++type staticSource []byte
++
++func (s staticSource) ConfigList(context.Context, string) ([]byte, time.Duration, error) {
++	return append([]byte(nil), s...), time.Minute, nil
++}
++
++func TestECHRequestAndSafeRetry(t *testing.T) {
++	cert, roots := testCertificate(t)
++	staleConfig, _ := testECHConfig(t, 1)
++	retryConfig, retryKey := testECHConfig(t, 2)
++	var requests atomic.Int32
++	var dialArgs []string
++	var dialMu sync.Mutex
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		if r.TLS == nil || !r.TLS.ECHAccepted || r.TLS.ServerName != "secret.example" {
++			http.Error(w, "ECH was not accepted for the inner name", http.StatusBadRequest)
++			return
++		}
++		w.WriteHeader(http.StatusOK)
++	}))
++	server.TLS = &tls.Config{
++		MinVersion:               tls.VersionTLS13,
++		Certificates:             []tls.Certificate{cert},
++		EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{{Config: retryConfig, PrivateKey: retryKey, SendAsRetry: true}},
++	}
++	server.StartTLS()
++	t.Cleanup(server.Close)
++
++	base, endpoint := testTransport(t, server, roots, &dialArgs, &dialMu)
++	client := &http.Client{Transport: WrapTransport(base, staticSource(echConfigList(staleConfig)))}
++	resp, err := client.Get("https://secret.example" + endpoint.Path)
++	if err != nil {
++		t.Fatalf("ECH request with authenticated retry config failed: %v", err)
++	}
++	_ = resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("unexpected status: %s", resp.Status)
++	}
++	if got := requests.Load(); got != 1 {
++		t.Fatalf("server received %d HTTP requests, want 1", got)
++	}
++	dialMu.Lock()
++	gotDialArgs := append([]string(nil), dialArgs...)
++	dialMu.Unlock()
++	if len(gotDialArgs) < 2 {
++		t.Fatalf("DialContext called %d times, want initial and pinned retry dials", len(gotDialArgs))
++	}
++	if addr, _, err := net.SplitHostPort(gotDialArgs[1]); err != nil || net.ParseIP(addr) == nil {
++		t.Fatalf("retry dial was not pinned to a numeric IP: %q", gotDialArgs[1])
++	}
++}
++
++func TestECHRejectionDoesNotDowngradeAndVerifiesPublicName(t *testing.T) {
++	cert, roots := testCertificate(t)
++	config, _ := testECHConfig(t, 3)
++	var requests atomic.Int32
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		w.WriteHeader(http.StatusOK)
++	}))
++	// No ECH key: this server rejects ECH and cannot provide retry configs.
++	server.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
++	server.StartTLS()
++	t.Cleanup(server.Close)
++
++	base, endpoint := testTransport(t, server, roots, nil, nil)
++	client := &http.Client{Transport: WrapTransport(base, staticSource(echConfigList(config)))}
++	_, err := client.Get("https://secret.example" + endpoint.Path)
++	var rejection *tls.ECHRejectionError
++	if !errors.As(err, &rejection) {
++		t.Fatalf("got %v, want verified ECHRejectionError", err)
++	}
++	if got := requests.Load(); got != 0 {
++		t.Fatalf("ECH rejection sent %d HTTP requests; want no request and no plaintext retry", got)
++	}
++
++	// The public-name certificate must still chain to configured roots.
++	untrustedBase, endpoint := testTransport(t, server, x509.NewCertPool(), nil, nil)
++	untrustedClient := &http.Client{Transport: WrapTransport(untrustedBase, staticSource(echConfigList(config)))}
++	_, err = untrustedClient.Get("https://secret.example" + endpoint.Path)
++	if errors.As(err, &rejection) {
++		t.Fatalf("untrusted ECH provider certificate was accepted as a retry signal: %v", err)
++	}
++	if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "authority") {
++		t.Fatalf("got %v, want certificate verification error", err)
++	}
++}
++
++func testTransport(t *testing.T, server *httptest.Server, roots *x509.CertPool, dialArgs *[]string, dialMu *sync.Mutex) (*http.Transport, *url.URL) {
++	t.Helper()
++	endpoint, err := url.Parse(server.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	base := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
++	base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++		if dialArgs != nil {
++			dialMu.Lock()
++			*dialArgs = append(*dialArgs, addr)
++			dialMu.Unlock()
++		}
++		return (&net.Dialer{}).DialContext(ctx, network, endpoint.Host)
++	}
++	return base, endpoint
++}
++
++func testCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "ECH test"},
++		DNSNames:     []string{"secret.example", "public.example"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++		IsCA:         true,
++		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pair, err := tls.X509KeyPair(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: mustMarshalECKey(t, key)}))
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := x509.ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	roots := x509.NewCertPool()
++	roots.AddCert(cert)
++	return pair, roots
++}
++
++func mustMarshalECKey(t *testing.T, key *ecdsa.PrivateKey) []byte {
++	t.Helper()
++	der, err := x509.MarshalECPrivateKey(key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return der
++}
++
++func testECHConfig(t *testing.T, id uint8) ([]byte, []byte) {
++	t.Helper()
++	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var config cryptobyte.Builder
++	config.AddUint16(0xfe0d)
++	config.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
++		b.AddUint8(id)
++		b.AddUint16(0x0020) // DHKEM(X25519, HKDF-SHA256)
++		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes(privateKey.PublicKey().Bytes()) })
++		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
++			b.AddUint16(0x0001) // HKDF-SHA256
++			b.AddUint16(0x0001) // AES-128-GCM
++		})
++		b.AddUint8(32)
++		b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes([]byte("public.example")) })
++		b.AddUint16(0)
++	})
++	return config.BytesOrPanic(), privateKey.Bytes()
++}
++
++func echConfigList(config []byte) []byte {
++	var list cryptobyte.Builder
++	list.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes(config) })
++	return list.BytesOrPanic()
++}
+diff --git a/daemon/internal/tlsfragment/live_test.go b/daemon/internal/tlsfragment/live_test.go
+new file mode 100644
+index 0000000..5b0179d
+--- /dev/null
++++ b/daemon/internal/tlsfragment/live_test.go
+@@ -0,0 +1,32 @@
++package tlsfragment
++
++import (
++	"net/http"
++	"os"
++	"testing"
++	"time"
++)
++
++// TestLiveDockerRegistryV2 is opt-in because it needs external DNS and network
++// access. It uses the public /v2/ endpoint without credentials; an HTTP 401 is
++// the expected registry response and demonstrates that TLS completed.
++func TestLiveDockerRegistryV2(t *testing.T) {
++	if os.Getenv("MOBY_TLS_FRAGMENT_CLIENT_HELLO_LIVE_TEST") != "1" {
++		t.Skip("set MOBY_TLS_FRAGMENT_CLIENT_HELLO_LIVE_TEST=1 to contact Docker Hub")
++	}
++	t.Setenv(EnabledEnv, "1")
++	base := http.DefaultTransport.(*http.Transport).Clone()
++	transport := WrapTransport(base)
++	defer transport.CloseIdleConnections()
++	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
++
++	resp, err := client.Get("https://registry-1.docker.io/v2/")
++	if err != nil {
++		t.Fatalf("GET /v2/ through fragmented ClientHello failed: %v", err)
++	}
++	_ = resp.Body.Close()
++	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusOK {
++		t.Fatalf("unexpected Docker Hub /v2/ response: %s", resp.Status)
++	}
++	t.Logf("Docker Hub /v2/ completed TLS and returned %s", resp.Status)
++}
+diff --git a/daemon/internal/tlsfragment/proxy_test.go b/daemon/internal/tlsfragment/proxy_test.go
+new file mode 100644
+index 0000000..f8d026b
+--- /dev/null
++++ b/daemon/internal/tlsfragment/proxy_test.go
+@@ -0,0 +1,126 @@
++package tlsfragment
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/binary"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++)
++
++func TestClientHelloFragmentsThroughAuthenticatedHTTPProxy(t *testing.T) {
++	t.Setenv(EnabledEnv, "1")
++	registryServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	t.Cleanup(registryServer.Close)
++	registryURL, err := url.Parse(registryServer.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := x509.ParseCertificate(registryServer.TLS.Certificates[0].Certificate[0])
++	if err != nil {
++		t.Fatal(err)
++	}
++	serverName := ""
++	if len(cert.DNSNames) > 0 {
++		serverName = cert.DNSNames[0]
++	} else if len(cert.IPAddresses) > 0 {
++		serverName = cert.IPAddresses[0].String()
++	} else {
++		t.Fatal("test TLS certificate has no DNS or IP subject alternative name")
++	}
++	roots := x509.NewCertPool()
++	roots.AddCert(cert)
++
++	proxyAuth := make(chan string, 1)
++	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodConnect {
++			http.Error(w, "expected CONNECT", http.StatusMethodNotAllowed)
++			return
++		}
++		proxyAuth <- r.Header.Get("Proxy-Authorization")
++		hijacker, ok := w.(http.Hijacker)
++		if !ok {
++			http.Error(w, "hijacking unsupported", http.StatusInternalServerError)
++			return
++		}
++		clientConn, buffered, err := hijacker.Hijack()
++		if err != nil {
++			return
++		}
++		upstream, err := net.Dial("tcp", registryURL.Host)
++		if err != nil {
++			_, _ = io.WriteString(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
++			_ = clientConn.Close()
++			return
++		}
++		_, _ = io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
++		go func() {
++			_, _ = io.Copy(upstream, buffered)
++			_ = upstream.Close()
++		}()
++		go func() {
++			_, _ = io.Copy(clientConn, upstream)
++			_ = clientConn.Close()
++		}()
++	}))
++	t.Cleanup(proxy.Close)
++	proxyURL, err := url.Parse(proxy.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	proxyURL.User = url.UserPassword("registry-proxy", "test-secret")
++
++	capture := &writeCapture{}
++	base := &http.Transport{
++		Proxy:           http.ProxyURL(proxyURL),
++		TLSClientConfig: &tls.Config{RootCAs: roots},
++	}
++	base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
++		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
++		if err != nil {
++			return nil, err
++		}
++		return &capturedConn{Conn: conn, capture: capture}, nil
++	}
++	transport := WrapTransport(base)
++	defer transport.CloseIdleConnections()
++	endpoint := "https://" + net.JoinHostPort(serverName, registryURL.Port()) + "/v2/"
++	resp, err := (&http.Client{Transport: transport}).Get(endpoint)
++	if err != nil {
++		t.Fatalf("HTTPS request through authenticated CONNECT proxy failed: %v", err)
++	}
++	_ = resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("unexpected registry response through proxy: %s", resp.Status)
++	}
++	if got := <-proxyAuth; got != "Basic cmVnaXN0cnktcHJveHk6dGVzdC1zZWNyZXQ=" {
++		t.Fatalf("proxy received Proxy-Authorization %q, want the configured Basic credentials", got)
++	}
++
++	var helloRecords int
++	for _, write := range capture.snapshot() {
++		if strings.HasPrefix(string(write), "CONNECT ") {
++			continue
++		}
++		if len(write) >= tlsRecordHeaderLen && write[0] == tlsHandshakeRecordType {
++			if int(binary.BigEndian.Uint16(write[3:5])) != len(write)-tlsRecordHeaderLen {
++				t.Fatalf("proxied TLS record length header does not match bytes")
++			}
++			if len(write)-tlsRecordHeaderLen > defaultRecordPayloadLimit {
++				t.Fatalf("proxied TLS record payload exceeds configured limit")
++			}
++			helloRecords++
++		}
++	}
++	if helloRecords < 2 {
++		t.Fatalf("observed %d proxied TLS handshake records, want fragmented ClientHello", helloRecords)
++	}
++}
+diff --git a/daemon/internal/tlsfragment/transport.go b/daemon/internal/tlsfragment/transport.go
+new file mode 100644
+index 0000000..589c0ad
+--- /dev/null
++++ b/daemon/internal/tlsfragment/transport.go
+@@ -0,0 +1,135 @@
++// Package tlsfragment provides an opt-in prototype for splitting a TLS
++// ClientHello handshake message across multiple TLS records.
++//
++// It is intended for local experimentation only. Enable it by setting
++// MOBY_TLS_FRAGMENT_CLIENT_HELLO=1 in the daemon environment. The package keeps
++// net/http's proxy selection and TLS configuration intact; certificate
++// verification remains the responsibility of crypto/tls.
++package tlsfragment
++
++import (
++	"context"
++	"encoding/binary"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"sync"
++	"time"
++)
++
++const (
++	// EnabledEnv enables this experimental behavior when its value is exactly "1".
++	EnabledEnv = "MOBY_TLS_FRAGMENT_CLIENT_HELLO"
++
++	defaultRecordPayloadLimit = 128
++	tlsRecordHeaderLen        = 5
++	handshakeHeaderLen        = 4
++	tlsHandshakeRecordType    = 0x16
++	tlsClientHelloType        = 0x01
++)
++
++// WrapTransport clones base and wraps its dialed connections if the opt-in
++// environment variable is set. It returns base unchanged when disabled or when
++// a custom TLS dialer is configured, because those dialers own TLS record
++// generation and cannot be safely intercepted here.
++func WrapTransport(base *http.Transport) *http.Transport {
++	if base == nil || os.Getenv(EnabledEnv) != "1" || base.DialTLS != nil || base.DialTLSContext != nil {
++		return base
++	}
++
++	tr := base.Clone()
++	dial := tr.DialContext
++	if dial == nil {
++		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
++		dial = dialer.DialContext
++	}
++	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
++		conn, err := dial(ctx, network, address)
++		if err != nil {
++			return nil, err
++		}
++		return &fragmentConn{Conn: conn, recordPayloadLimit: defaultRecordPayloadLimit}, nil
++	}
++	return tr
++}
++
++type fragmentConn struct {
++	net.Conn
++	recordPayloadLimit int
++
++	mu   sync.Mutex
++	done bool
++}
++
++// Write only rewrites the first complete TLS record containing a complete
++// ClientHello. Plain HTTP proxy CONNECT requests pass through untouched; this
++// lets the same wrapper work for both direct connections and HTTP proxies.
++func (c *fragmentConn) Write(p []byte) (int, error) {
++	c.mu.Lock()
++	if c.done || !looksLikeHandshakeRecord(p) {
++		c.mu.Unlock()
++		return c.Conn.Write(p)
++	}
++	frames, ok := splitClientHelloRecord(p, c.recordPayloadLimit)
++	c.done = true
++	if !ok {
++		c.mu.Unlock()
++		return c.Conn.Write(p)
++	}
++
++	// Keep writes serialized: TLS record order is significant, and a connection
++	// may otherwise receive concurrent writes from callers.
++	defer c.mu.Unlock()
++	for _, frame := range frames {
++		n, err := c.Conn.Write(frame)
++		if err != nil {
++			return 0, err
++		}
++		if n != len(frame) {
++			return 0, io.ErrShortWrite
++		}
++	}
++	return len(p), nil
++}
++
++func looksLikeHandshakeRecord(p []byte) bool {
++	return len(p) > 0 && p[0] == tlsHandshakeRecordType
++}
++
++// splitClientHelloRecord returns TLS records whose concatenated handshake
++// payload is byte-for-byte identical to the original ClientHello. The incoming
++// write is left untouched unless it is exactly one complete ClientHello record
++// and needs splitting.
++func splitClientHelloRecord(record []byte, recordPayloadLimit int) ([][]byte, bool) {
++	if recordPayloadLimit <= 0 || len(record) < tlsRecordHeaderLen+handshakeHeaderLen || record[0] != tlsHandshakeRecordType {
++		return nil, false
++	}
++	payloadLen := int(binary.BigEndian.Uint16(record[3:5]))
++	if payloadLen != len(record)-tlsRecordHeaderLen || record[1] != 0x03 {
++		return nil, false
++	}
++	payload := record[tlsRecordHeaderLen:]
++	if payload[0] != tlsClientHelloType {
++		return nil, false
++	}
++	handshakeLen := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
++	if handshakeLen != len(payload)-handshakeHeaderLen || len(payload) <= recordPayloadLimit {
++		return nil, false
++	}
++
++	frames := make([][]byte, 0, (len(payload)+recordPayloadLimit-1)/recordPayloadLimit)
++	for offset := 0; offset < len(payload); offset += recordPayloadLimit {
++		end := min(offset+recordPayloadLimit, len(payload))
++		frame := make([]byte, tlsRecordHeaderLen+end-offset)
++		frame[0] = record[0]
++		copy(frame[1:3], record[1:3])
++		binary.BigEndian.PutUint16(frame[3:5], uint16(end-offset))
++		copy(frame[tlsRecordHeaderLen:], payload[offset:end])
++		frames = append(frames, frame)
++	}
++	if len(frames) < 2 {
++		return nil, false
++	}
++	return frames, true
++}
+diff --git a/daemon/internal/tlsfragment/transport_test.go b/daemon/internal/tlsfragment/transport_test.go
+new file mode 100644
+index 0000000..4105731
+--- /dev/null
++++ b/daemon/internal/tlsfragment/transport_test.go
+@@ -0,0 +1,221 @@
++package tlsfragment
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/binary"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync"
++	"testing"
++)
++
++func TestSplitClientHelloRecord(t *testing.T) {
++	const limit = 128
++	payload := make([]byte, handshakeHeaderLen+500)
++	payload[0] = tlsClientHelloType
++	payload[1] = 0
++	payload[2] = 1
++	payload[3] = 0xf4
++	for i := handshakeHeaderLen; i < len(payload); i++ {
++		payload[i] = byte(i)
++	}
++	record := make([]byte, tlsRecordHeaderLen+len(payload))
++	record[0], record[1], record[2] = tlsHandshakeRecordType, 0x03, 0x01
++	binary.BigEndian.PutUint16(record[3:5], uint16(len(payload)))
++	copy(record[tlsRecordHeaderLen:], payload)
++
++	frames, ok := splitClientHelloRecord(record, limit)
++	if !ok || len(frames) < 2 {
++		t.Fatalf("splitClientHelloRecord() = (%d frames, %t), want multiple frames", len(frames), ok)
++	}
++	var joined []byte
++	for i, frame := range frames {
++		if frame[0] != tlsHandshakeRecordType || frame[1] != record[1] || frame[2] != record[2] {
++			t.Fatalf("frame %d has unexpected TLS record header: %x", i, frame[:tlsRecordHeaderLen])
++		}
++		if int(binary.BigEndian.Uint16(frame[3:5])) != len(frame)-tlsRecordHeaderLen {
++			t.Fatalf("frame %d record length does not match payload", i)
++		}
++		if len(frame)-tlsRecordHeaderLen > limit {
++			t.Fatalf("frame %d payload is %d bytes, limit is %d", i, len(frame)-tlsRecordHeaderLen, limit)
++		}
++		joined = append(joined, frame[tlsRecordHeaderLen:]...)
++	}
++	if string(joined) != string(payload) {
++		t.Fatal("fragment payloads do not reconstruct the original ClientHello")
++	}
++}
++
++func TestEnabledTransportFragmentsClientHelloAndVerifiesCertificate(t *testing.T) {
++	t.Setenv(EnabledEnv, "1")
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = io.WriteString(w, "registry test ok")
++	}))
++	t.Cleanup(server.Close)
++
++	parsedURL, err := url.Parse(server.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := parsedURL.Port()
++	cert, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
++	if err != nil {
++		t.Fatal(err)
++	}
++	serverName := ""
++	if len(cert.DNSNames) > 0 {
++		serverName = cert.DNSNames[0]
++	} else if len(cert.IPAddresses) > 0 {
++		serverName = cert.IPAddresses[0].String()
++	} else {
++		t.Fatal("test TLS certificate has no DNS or IP subject alternative name")
++	}
++	endpoint := "https://" + net.JoinHostPort(serverName, port) + "/v2/"
++	roots := x509.NewCertPool()
++	roots.AddCert(cert)
++	capture := &writeCapture{}
++	base := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
++	base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
++		conn, err := (&net.Dialer{}).DialContext(ctx, network, parsedURL.Host)
++		if err != nil {
++			return nil, err
++		}
++		return &capturedConn{Conn: conn, capture: capture}, nil
++	}
++
++	transport := WrapTransport(base)
++	if transport == base {
++		t.Fatal("enabled WrapTransport returned the unwrapped base transport")
++	}
++	resp, err := (&http.Client{Transport: transport}).Get(endpoint)
++	if err != nil {
++		t.Fatalf("verified HTTPS request through fragmented ClientHello failed: %v", err)
++	}
++	body, readErr := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if readErr != nil {
++		t.Fatal(readErr)
++	}
++	if resp.StatusCode != http.StatusOK || string(body) != "registry test ok" {
++		t.Fatalf("unexpected HTTPS response: status=%s body=%q", resp.Status, body)
++	}
++
++	writes := capture.snapshot()
++	var helloRecords [][]byte
++	for _, write := range writes {
++		if len(write) >= tlsRecordHeaderLen && write[0] == tlsHandshakeRecordType {
++			helloRecords = append(helloRecords, write)
++			continue
++		}
++		if len(helloRecords) > 0 {
++			break
++		}
++	}
++	if len(helloRecords) < 2 {
++		t.Fatalf("observed %d outbound handshake records, want fragmented ClientHello records; writes=%d", len(helloRecords), len(writes))
++	}
++	var joined []byte
++	for i, record := range helloRecords {
++		if int(binary.BigEndian.Uint16(record[3:5])) != len(record)-tlsRecordHeaderLen {
++			t.Fatalf("wire record %d length header does not match bytes", i)
++		}
++		if len(record)-tlsRecordHeaderLen > defaultRecordPayloadLimit {
++			t.Fatalf("wire record %d payload exceeds configured limit", i)
++		}
++		joined = append(joined, record[tlsRecordHeaderLen:]...)
++	}
++	if len(joined) < handshakeHeaderLen || joined[0] != tlsClientHelloType {
++		t.Fatalf("observed records do not begin with a ClientHello: %x", joined[:min(len(joined), 8)])
++	}
++	helloLen := int(joined[1])<<16 | int(joined[2])<<8 | int(joined[3])
++	if helloLen != len(joined)-handshakeHeaderLen {
++		t.Fatalf("reassembled ClientHello length is %d, got %d payload bytes", helloLen, len(joined)-handshakeHeaderLen)
++	}
++
++	// An otherwise identical request with no trust roots must fail; the
++	// fragmentation layer must not relax crypto/tls certificate verification.
++	untrusted := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool()}}
++	untrusted.DialContext = base.DialContext
++	untrustedClient := &http.Client{Transport: WrapTransport(untrusted)}
++	_, err = untrustedClient.Get(endpoint)
++	if err == nil || (!strings.Contains(strings.ToLower(err.Error()), "certificate") && !strings.Contains(strings.ToLower(err.Error()), "authority")) {
++		t.Fatalf("untrusted server certificate error = %v, want certificate verification failure", err)
++	}
++}
++
++func TestDisabledTransportIsUnchanged(t *testing.T) {
++	t.Setenv(EnabledEnv, "")
++	base := &http.Transport{}
++	if got := WrapTransport(base); got != base {
++		t.Fatal("disabled WrapTransport should return the original transport")
++	}
++}
++
++type writeCapture struct {
++	mu     sync.Mutex
++	writes [][]byte
++}
++
++func (c *writeCapture) add(data []byte) {
++	c.mu.Lock()
++	c.writes = append(c.writes, append([]byte(nil), data...))
++	c.mu.Unlock()
++}
++
++func (c *writeCapture) snapshot() [][]byte {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	out := make([][]byte, len(c.writes))
++	for i := range c.writes {
++		out[i] = append([]byte(nil), c.writes[i]...)
++	}
++	return out
++}
++
++type capturedConn struct {
++	net.Conn
++	capture *writeCapture
++}
++
++func (c *capturedConn) Write(p []byte) (int, error) {
++	c.capture.add(p)
++	return c.Conn.Write(p)
++}
++
++func TestEnabledTransportPreservesProxyAndTLSSettings(t *testing.T) {
++	t.Setenv(EnabledEnv, "1")
++	proxyURL, err := url.Parse("http://proxy-user:proxy-pass@proxy.example:3128")
++	if err != nil {
++		t.Fatal(err)
++	}
++	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
++	base := &http.Transport{
++		Proxy:           http.ProxyURL(proxyURL),
++		TLSClientConfig: tlsConfig,
++		ProxyConnectHeader: http.Header{
++			"Proxy-Authorization": []string{"Basic cHJveHktYXV0aA=="},
++		},
++	}
++
++	transport := WrapTransport(base)
++	request := httptest.NewRequest(http.MethodGet, "https://registry.example/v2/", nil)
++	selectedProxy, err := transport.Proxy(request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if selectedProxy == nil || selectedProxy.String() != proxyURL.String() {
++		t.Fatalf("proxy selection changed: got %v, want %s", selectedProxy, proxyURL)
++	}
++	if transport.TLSClientConfig == nil || transport.TLSClientConfig.MinVersion != tlsConfig.MinVersion || transport.TLSClientConfig.InsecureSkipVerify != tlsConfig.InsecureSkipVerify {
++		t.Fatal("TLS verification settings changed while wrapping the transport")
++	}
++	if got := transport.ProxyConnectHeader.Get("Proxy-Authorization"); got != "Basic cHJveHktYXV0aA==" {
++		t.Fatalf("Proxy-Authorization CONNECT header changed: %q", got)
++	}
++}

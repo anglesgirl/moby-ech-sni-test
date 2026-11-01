@@ -1,0 +1,11 @@
+Artifact: Moby ECH + TLS ClientHello fragmentation test package
+Target: linux/amd64 (x86_64)
+Binary: dockerd (static Go ELF, CGO_ENABLED=0)
+Version: 0.0.0-dev+ech-sni-prototype
+Source revision: 9aa9edf (working tree includes uncommitted prototype changes)
+Go toolchain: go1.26.8
+Features: ECH discovery for registry HTTPS clients; opt-in TLS ClientHello record fragmentation via MOBY_TLS_FRAGMENT_CLIENT_HELLO=1
+Container runtime mode in launcher: embedded containerd, separate data root and exec root
+Required host dependencies for the supplied pull test: runc in root's PATH; Docker CLI; outbound DNS/HTTPS and CA trust bundle
+Checks performed: gofmt validation; go test ./daemon/internal/echtls ./daemon/internal/tlsfragment; Linux amd64 static build; dockerd --version; dockerd --help; dockerd --validate with isolated-runtime flags; checksum/archive verification
+Runtime note: daemon reached embedded-containerd startup, then exited during BuildKit initialization because this build sandbox has no runc binary. The packaged start script now preflights runc and will fail early with that requirement rather than falsely report a successful launch.
